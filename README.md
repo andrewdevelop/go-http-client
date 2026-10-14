@@ -52,6 +52,78 @@ c := httpclient.NewClient(httpclient.Config{
 })
 ```
 
+## Configuration reference
+
+Every field across `Config` and its sub-configs, grouped by what it controls. "Default" is the zero value's effect unless noted. Fields marked **overrides siblings** make the rest of that group's fields ignored once set — see [Contracts](#contracts-extension-interfaces) above.
+
+### General (`Config`)
+
+| Field | Default | Options | Effect |
+|---|---|---|---|
+| `BaseURL` | `""` | any URL | Prepended to a `Request.Path` that isn't already absolute (`http://`/`https://`). |
+| `Timeout` | `DefaultTimeout` (30s) when `HTTPClient` is nil | any `time.Duration` | Bounds **one physical attempt**, not the whole retry loop. Ignored if `HTTPClient` is set. |
+| `HTTPClient` | `nil` (built from `Timeout`/`Transport`/`CheckRedirect`/`Jar`) | any `*http.Client` | Supplying your own means you own all of `Timeout`/`Transport`/`CheckRedirect`/`Jar` yourself — those four `Config` fields are then ignored. |
+| `Transport` | `nil` (→ `http.DefaultTransport`) | any `http.RoundTripper` | The underlying `RoundTripper` — plug in an instrumenting/tracing/mocking one (e.g. `MockAdapter`). Ignored if `HTTPClient` is set. |
+| `CheckRedirect` | `nil` (net/http default: follow ≤10 redirects) | `func(req *http.Request, via []*http.Request) error` | Redirect policy. Ignored if `HTTPClient` is set. |
+| `Jar` | `nil` (no cookies sent/stored) | any `http.CookieJar` | Set only if the remote API relies on cookie sessions. Ignored if `HTTPClient` is set. |
+| `Headers` | `nil` | `http.Header` | Merged into every request; per-request headers win on conflict. |
+| `IdempotencyHeaderName` | `DefaultIdempotencyHeaderName` (`"Idempotency-Key"`) | any header name | Header `Request.IdempotencyKey` is sent under. |
+| `MaxResponseBytes` | `0` (unlimited) | `>0` byte count | Caps response body size read off the wire. Exceeding it fails with `ErrResponseTooLarge`, which is **never retried**. |
+| `MaxConcurrency` | `0` (unlimited) | `>0` | Bulkhead: max requests in flight through this `Client` at once. A request beyond the limit **blocks** (bounded by its context) rather than failing fast. Independent of `RateLimit`. |
+
+### Retry (`Config.Retry`, type `RetryConfig`)
+
+| Field | Default | Options | Effect |
+|---|---|---|---|
+| `Enabled` | `false` | `bool` | Master switch. `false` → no retry loop at all (one attempt; the rate limiter and breaker still run around it). |
+| `MaxAttempts` | `0` → treated as `1` | `≥1` | Total attempts **including** the first — `3` means up to 2 retries. |
+| `BaseDelay` | `0` | any `time.Duration` | Backoff before the first retry; doubles each subsequent attempt. Floored at 1ms internally so `0` doesn't hot-loop. |
+| `MaxDelay` | `0` (no cap) | any `time.Duration` | Ceiling the exponential backoff can't exceed. |
+| `Jitter` | `false` | `bool` | Adds up to +50% random jitter on top of the computed delay. |
+| `RetryableStatusCodes` | `nil` → `DefaultRetryableStatusCodes` (429, 500, 502, 503, 504) | `[]int` | Which non-2xx statuses trigger a retry. Network errors (DNS, connection refused, timeout) are always retryable regardless of this list. **Ignored if `Policy` is set.** |
+| `Policy` | `nil` → built-in status-code policy | `RetryPolicy` — **overrides siblings** (`RetryableStatusCodes`/`BaseDelay`/`MaxDelay`/`Jitter`) | Replaces the per-attempt retry/backoff decision entirely (e.g. to honor `Retry-After`). `MaxAttempts`/`Enabled` still apply around it. |
+| `RetryNonIdempotent` | `false` | `bool` | `false` → `POST`/`PATCH` are only retried if the request sets `Idempotent`/`IdempotencyKey`. `true` → retries ignore idempotency entirely (old "retry everything" behavior). Methods idempotent by HTTP semantics (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`) are always retried regardless. |
+
+### Rate limiting (`Config.RateLimit`, type `RateLimitConfig`)
+
+| Field | Default | Options | Effect |
+|---|---|---|---|
+| `Enabled` | `false` | `bool` | Master switch. `false` → no throttling. |
+| `RPS` | `0` | `float64` (`>0`) | Sustained token refill rate (requests/second). |
+| `Burst` | `0` | `int` (`≥0`) | Max tokens that can accumulate, i.e. how many requests can fire back-to-back before `RPS` pacing kicks in. |
+| `Wait` | `false` | `bool` | `true` → block until a token is available, bounded by the request's context. `false` → fail immediately with `ErrRateLimited` when no token is free. |
+| `Store` | `nil` → built-in `golang.org/x/time/rate` limiter | `Limiter` — **overrides siblings** (`Enabled`/`RPS`/`Burst`/`Wait`) | Swap in a distributed limiter shared across instances/processes. |
+
+### Circuit breaker (`Config.CircuitBreaker`, type `CircuitBreakerConfig`)
+
+| Field | Default | Options | Effect |
+|---|---|---|---|
+| `Enabled` | `false` | `bool` | Master switch. `false` → every request runs straight through, no breaker. |
+| `Threshold` | `0` | `int` (practically `≥1`) | Minimum failure count within `Interval` before the breaker becomes eligible to trip (also needs ≥50% failure ratio). |
+| `Interval` | `0` | any `time.Duration` | Rolling window the failure count above is measured over. |
+| `Timeout` | `0` | any `time.Duration` | How long the breaker stays open before letting one trial request through (half-open). |
+| `HalfOpenMaxCalls` | `0` | `int` (practically `≥1`) | Trial requests allowed through while half-open before the breaker fully closes again. |
+| `Store` | `nil` → built-in `sony/gobreaker` wrapper | `Breaker` — **overrides siblings** (`Enabled`/`Threshold`/`Interval`/`Timeout`/`HalfOpenMaxCalls`) | Swap in a different breaker library, or one sharing trip state across instances. |
+
+### Cache (`Config.Cache`, type `CacheConfig`)
+
+| Field | Default | Options | Effect |
+|---|---|---|---|
+| `Store` | `nil` (caching disabled regardless of `Enabled`) | any `Cache` implementation | The cache backend — this package ships only the interface. |
+| `Enabled` | `false` | `bool` | Master switch; also needs `Store` set to actually do anything. |
+| `TTL` | `0` | any `time.Duration` | Passed to `Cache.Set` for each entry — interpretation (e.g. "no expiration" for `0`) is up to the `Cache` implementation. |
+| `KeyFunc` | `nil` → `DefaultCacheKey` (SHA-256 of method + resolved URL + body) | `func(*Request) string` | How a cache key is derived from a request. |
+
+### Per-request overrides (`Request`, not `Config`)
+
+These aren't `Config` fields — they're set per-request via `NewRequest(...).Set*(...)` — but they directly gate the `Cache`/`Retry` groups above, so they're part of the same picture.
+
+| Field | Default | Options | Effect |
+|---|---|---|---|
+| `Cacheable` | `false` | `bool` | `GET` is cached automatically regardless of this flag; any other method is cached only when this is `true` (and `Cache.Enabled`/`Store` are set). |
+| `Idempotent` | `false` | `bool` | Asserts a non-idempotent method (`POST`/`PATCH`) is safe to retry — see `RetryConfig.RetryNonIdempotent`. No effect on methods already idempotent by HTTP semantics. |
+| `IdempotencyKey` | `""` | any string (see `NewIdempotencyKey()`) | Sent under `Config.IdempotencyHeaderName` on every attempt; also implies `Idempotent`. |
+
 ## Installation
 
 ```bash
@@ -229,6 +301,44 @@ resp, err := c.Do(ctx, req)
 ```
 
 The key is sent in the `Idempotency-Key` header (configurable via `Config.IdempotencyHeaderName`) on every attempt, including retries — the same value each time, so the server can deduplicate. To disable this gate entirely and go back to "retry everything" — `RetryConfig.RetryNonIdempotent: true`.
+
+### Stripe example
+
+Stripe is the API that made `Idempotency-Key` a convention in the first place, and its semantics are a good concrete illustration of what the header actually buys you: Stripe stores the (key, endpoint) pair for 24 hours. A repeated request with the same key against the same endpoint is **not re-executed** — Stripe just replays the stored response from the first attempt, success or failure. Send the same key with *different* parameters, though, and Stripe rejects it outright — that mismatch usually means a bug (a key got reused across two different charges).
+
+```go
+stripe := httpclient.NewClient(httpclient.Config{
+    BaseURL: "https://api.stripe.com/v1",
+    Headers: http.Header{
+        "Authorization": []string{"Bearer " + secretKey},
+    },
+    Retry: httpclient.RetryConfig{
+        Enabled:   true,
+        MaxAttempts: 4,
+        BaseDelay:   time.Second,
+        Jitter:      true,
+    },
+})
+
+// Stripe's classic APIs take form-encoded bodies, not JSON — this
+// package doesn't care either way, it only ever moves raw []byte.
+form := url.Values{
+    "amount":   {"2000"},
+    "currency": {"usd"},
+    "source":   {"tok_visa"},
+}
+
+req := httpclient.NewRequest(http.MethodPost, "/charges").
+    SetBody([]byte(form.Encode())).
+    SetHeader("Content-Type", "application/x-www-form-urlencoded").
+    SetIdempotencyKey(httpclient.NewIdempotencyKey())
+
+resp, err := stripe.Do(ctx, req)
+```
+
+`Config.IdempotencyHeaderName` doesn't even need setting here — it already defaults to `"Idempotency-Key"`, Stripe's own header name.
+
+One easy mistake worth calling out: generate the key **once per logical operation**, not once per `Do` call. Our retry loop already reuses the same `*Request` (and so the same key) across every physical attempt automatically — that part's free. But if the *caller* retries at a higher level (e.g. a user clicks "Pay" again after their browser timed out, with no idea whether the first charge went through), a fresh `httpclient.NewIdempotencyKey()` on that second click defeats the whole point. Generate the key once up front — e.g. when the order is created — persist it alongside the order, and reuse it for every attempt at charging that specific order, however many layers of retry sit above this client.
 
 ## Resource limits
 

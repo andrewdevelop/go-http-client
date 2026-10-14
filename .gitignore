@@ -1,0 +1,19 @@
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Claude Code / tooling local state
+.claude/
